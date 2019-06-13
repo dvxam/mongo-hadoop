@@ -39,6 +39,13 @@ import org.apache.pig.impl.util.UDFContext;
 import org.apache.pig.impl.util.Utils;
 import org.joda.time.DateTime;
 
+
+import org.bson.types.ObjectId;
+import org.bson.BsonDateTime;
+import org.joda.time.DateTime;
+import org.joda.time.format.DateTimeFormat;
+import org.joda.time.format.DateTimeFormatter;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -57,6 +64,7 @@ public class BSONStorage extends StoreFunc implements StoreMetadata {
 
     private String udfcSignature = null;
     private String idField = null;
+    private static final DateTimeFormatter DATETIME_FORMAT = DateTimeFormat.forPattern("yyyy-MM-dd HH:mm:ss");
 
     private final BSONFileOutputFormat outputFormat = new BSONFileOutputFormat();
 
@@ -65,6 +73,21 @@ public class BSONStorage extends StoreFunc implements StoreMetadata {
 
     public BSONStorage(final String idField) {
         this.idField = idField;
+    }
+    
+    public static Object getTypeForBSON(
+        final Object o, 
+        final ResourceFieldSchema field, 
+        final String toIgnore
+    ) throws IOException {
+       return getTypeForBSON(
+           o, 
+           field, 
+           toIgnore, 
+           new ArrayList<String>(), 
+           new ArrayList<String>(),
+           new ArrayList<String>()
+        );
     }
 
     /**
@@ -76,7 +99,14 @@ public class BSONStorage extends StoreFunc implements StoreMetadata {
      * @return an Object that can be stored as BSON.
      * @throws IOException if no schema is available from the field
      */
-    public static Object getTypeForBSON(final Object o, final ResourceFieldSchema field, final String toIgnore)
+    public static Object getTypeForBSON(
+        final Object o, 
+        final ResourceFieldSchema field, 
+        final String toIgnore,
+        final ArrayList<String> dateFields,
+        final ArrayList<String> objectIdFields,
+        final ArrayList<String> keysContext
+    )
       throws IOException {
         byte dataType;
         ResourceSchema fieldInnerSchema = null;
@@ -108,7 +138,22 @@ public class BSONStorage extends StoreFunc implements StoreMetadata {
                 }
                 return o.toString();
             case DataType.CHARARRAY:
-                return o;
+                String chars = (String) o;
+                if (chars.isEmpty()) {
+                    return "";
+                }
+
+                String fieldNameWithContext = keysContext.isEmpty() 
+                    ? field.getName()
+                    : String.join(".", keysContext);
+
+                if (dateFields.contains(fieldNameWithContext)) {
+                    return DateTime.parse(chars, DATETIME_FORMAT).toDate();
+                }
+                if (objectIdFields.contains(fieldNameWithContext)) {
+                    return new ObjectId(chars);
+                }
+                return chars;
             case DataType.DATETIME:
                 return ((DateTime) o).toDate();
             //Given a TUPLE, create a Map so BSONEncoder will eat it
@@ -128,13 +173,15 @@ public class BSONStorage extends StoreFunc implements StoreMetadata {
                 // <*> -> can be any string since the field name of the tuple in
                 // a bag should be ignored
                 if (1 == fs.length && fs[0].getName().equals(toIgnore)) {
-                    return getTypeForBSON(((Tuple) o).get(0), fs[0], toIgnore);
+                    return getTypeForBSON(((Tuple) o).get(0), fs[0], toIgnore, dateFields, objectIdFields, keysContext);
                 }
                 // If there is more than one field in the tuple or no fields
                 // to ignore, treat the Tuple as a Map.
                 Map<String, Object> m = new LinkedHashMap<String, Object>();
                 for (int j = 0; j < fs.length; j++) {
-                    m.put(fs[j].getName(), getTypeForBSON(((Tuple) o).get(j), fs[j], toIgnore));
+                    ArrayList<String> newKeysContext = (ArrayList<String>) keysContext.clone();
+                    newKeysContext.add(fs[j].getName());
+                    m.put(fs[j].getName(), getTypeForBSON(((Tuple) o).get(j), fs[j], toIgnore, dateFields, objectIdFields, newKeysContext));
                 }
                 return m;
             // Given a BAG, create an Array so BSONEncoder will eat it.
@@ -147,7 +194,7 @@ public class BSONStorage extends StoreFunc implements StoreMetadata {
                 fs = fieldInnerSchema.getFields();
                 ArrayList<Object> bagList = new ArrayList<Object>();
                 for (Tuple t : (DataBag) o) {
-                    bagList.add(getTypeForBSON(t, fs[0], toIgnore));
+                    bagList.add(getTypeForBSON(t, fs[0], toIgnore, dateFields, objectIdFields, keysContext));
                 }
                 return bagList;
             case DataType.MAP:
@@ -157,7 +204,16 @@ public class BSONStorage extends StoreFunc implements StoreMetadata {
                 Map map = (Map) o;
                 Map<String, Object> out = new HashMap<String, Object>(map.size());
                 for (Object key : map.keySet()) {
-                    out.put(key.toString(), getTypeForBSON(map.get(key), null, toIgnore));
+                    ArrayList<String> newKeysContext = (ArrayList<String>) keysContext.clone();
+                    newKeysContext.add(key.toString());
+                    out.put(key.toString(), getTypeForBSON(
+                        map.get(key), 
+                        null, 
+                        toIgnore, 
+                        dateFields, 
+                        objectIdFields, 
+                        newKeysContext
+                    ));
                 }
                 return out;
             default:
